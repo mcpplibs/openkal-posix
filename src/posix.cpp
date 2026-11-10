@@ -687,6 +687,12 @@ int kal_process_spawn(const kal_spawn* how, const char* path, kal_uintptr path_l
     const int base = unpack(how->base.h), work = unpack(how->work.h);
     if (base < 0 || work < 0) return kal_err_invalid;
 
+    // The environment given is examined before anything is allocated or opened.
+    for (kal_uintptr i = 0; i < envc; ++i) {
+        if (!envp || !envp[i] || !envp_lens) return kal_err_invalid;
+        const char* eq = static_cast<const char*>(memchr(envp[i], '=', envp_lens[i]));
+        if (!eq || eq == envp[i]) return kal_err_invalid;
+    }
     char p[PATH_MAX]; memcpy(p, path, path_len); p[path_len] = '\0';
     // The program is named relative to `base': resolve it to a descriptor now,
     // so that a start that cannot happen is reported by its reason.
@@ -696,6 +702,38 @@ int kal_process_spawn(const kal_spawn* how, const char* path, kal_uintptr path_l
     if (fstat(exe, &st) != 0) { close(exe); return fail(); }
     if (S_ISDIR(st.st_mode)) { close(exe); return kal_err_is_directory; }
     if (!(st.st_mode & 0111)) { close(exe); return kal_err_permission; }
+
+    // The null device at the positions that ask for it, opened before the start
+    // so that a failure is the caller's to see.
+    // A position with no stream placed and no null device keeps the caller's.
+    int fds[3] = { -1, -1, -1 };
+    const kal_uintptr nulls[3] = { KAL_SPAWN_NULL_IN, KAL_SPAWN_NULL_OUT, KAL_SPAWN_NULL_ERR };
+    if (streams) { fds[0] = unpack(streams->in.h); fds[1] = unpack(streams->out.h); fds[2] = unpack(streams->err.h); }
+    for (int i = 0; i < 3; ++i) {
+        if (!(how->flags & nulls[i])) continue;
+        fds[i] = open("/dev/null", (i == 0 ? O_RDONLY : O_WRONLY) | O_CLOEXEC);
+        if (fds[i] < 0) {
+            const int why = fail();
+            for (int k = 0; k < i; ++k) if (how->flags & nulls[k]) close(fds[k]);
+            close(exe);
+            return why;
+        }
+    }
+    auto release_nulls = [&] { for (int i = 0; i < 3; ++i) if (how->flags & nulls[i]) close(fds[i]); };
+
+    // The descriptor's name in /dev/fd, written before the start: the copy
+    // runs in a program that may have other contexts, where only functions
+    // safe in a signal handler may be called.
+    char self[32];
+    {
+        char digits[16]; int n = 0; unsigned v = unsigned(exe);
+        do { digits[n++] = char('0' + v % 10); v /= 10; } while (v);
+        const char prefix[] = "/dev/fd/";
+        size_t o = 0;
+        for (size_t i = 0; i + 1 < sizeof prefix; ++i) self[o++] = prefix[i];
+        while (n) self[o++] = digits[--n];
+        self[o] = 0;
+    }
 
     char** av = static_cast<char**>(calloc(argc + 1, sizeof(char*)));
     // THE ENVIRONMENT: the one given, or this program's; and the preference
@@ -709,8 +747,6 @@ int kal_process_spawn(const kal_spawn* how, const char* path, kal_uintptr path_l
     for (kal_uintptr i = 0; i < argc; ++i) av[i] = strndup(argv[i], argv_lens[i]);
     kal_uintptr en = 0;
     for (kal_uintptr i = 0; i < envc; ++i) {
-        const char* eq = static_cast<const char*>(memchr(envp[i], '=', envp_lens[i]));
-        if (!eq || eq == envp[i]) { close(exe); return kal_err_invalid; }
         if (pref && envp_lens[i] >= 14 && memcmp(envp[i], "KAL_RESOURCES=", 14) == 0) continue;
         ev[en++] = strndup(envp[i], envp_lens[i]);
     }
@@ -719,23 +755,37 @@ int kal_process_spawn(const kal_spawn* how, const char* path, kal_uintptr path_l
         ev[en++] = strdup(environ[i]);
     }
     if (pref) ev[en++] = strdup(pref);
-    int fds[3] = { 0, 1, 2 };
-    const kal_uintptr nulls[3] = { KAL_SPAWN_NULL_IN, KAL_SPAWN_NULL_OUT, KAL_SPAWN_NULL_ERR };
-    if (streams) { fds[0] = unpack(streams->in.h); fds[1] = unpack(streams->out.h); fds[2] = unpack(streams->err.h); }
-    for (int i = 0; i < 3; ++i) if (how->flags & nulls[i]) fds[i] = open("/dev/null", i == 0 ? O_RDONLY : O_WRONLY | O_CLOEXEC);
+    auto release_vectors = [&] {
+        for (kal_uintptr i = 0; i < argc; ++i) free(av[i]);
+        for (kal_uintptr i = 0; i < en; ++i) free(ev[i]);
+        free(av); free(ev);
+    };
 
     const pid_t join = how->job ? pid_t(how->job->h) : 0;  // 0: new unit
     // fork and exec rather than posix_spawn: the working directory is per
     // start, and posix_spawn_file_actions_addfchdir is not on every system.
     int report[2];
-    if (pipe(report) != 0) { close(exe); return fail(); }
+    if (pipe(report) != 0) {
+        const int why = fail();
+        release_vectors(); release_nulls(); close(exe);
+        return why;
+    }
     fcntl(report[1], F_SETFD, FD_CLOEXEC); fcntl(report[0], F_SETFD, FD_CLOEXEC);
     const pid_t pid = fork();
     if (pid == 0) {
         if (how->job) setpgid(0, join);
-        int saved[3];
-        for (int i = 0; i < 3; ++i) saved[i] = fcntl(fds[i], F_DUPFD_CLOEXEC, 10);
-        for (int i = 0; i < 3; ++i) if (saved[i] >= 0) dup2(saved[i], i);
+        // A position that cannot be placed ends the copy, and its reason is
+        // the caller's; the copy does not keep the caller's descriptor there.
+        int saved[3] = { -1, -1, -1 };
+        for (int i = 0; i < 3; ++i) {
+            if (fds[i] < 0) continue;
+            saved[i] = fcntl(fds[i], F_DUPFD_CLOEXEC, 10);
+            if (saved[i] < 0) { int e = errno; ssize_t w = write(report[1], &e, sizeof e); (void)w; _exit(127); }
+        }
+        for (int i = 0; i < 3; ++i) {
+            if (saved[i] < 0) continue;
+            if (dup2(saved[i], i) < 0) { int e = errno; ssize_t w = write(report[1], &e, sizeof e); (void)w; _exit(127); }
+        }
         for (int s = 1; s < NSIG; ++s) signal(s, SIG_DFL);
         sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, nullptr);
         if (fchdir(work) != 0) { int e = errno; ssize_t w = write(report[1], &e, sizeof e); (void)w; _exit(127); }
@@ -760,16 +810,13 @@ int kal_process_spawn(const kal_spawn* how, const char* path, kal_uintptr path_l
             refused(errno);
         }
 #endif
-        char self[64]; snprintf(self, sizeof self, "/dev/fd/%d", exe);
         execve(self, av, ev);
         int e = errno; ssize_t w = write(report[1], &e, sizeof e); (void)w;
         _exit(127);
     }
     close(report[1]); close(exe);
-    for (int i = 0; i < 3; ++i) if (how->flags & nulls[i]) close(fds[i]);
-    for (kal_uintptr i = 0; i < argc; ++i) free(av[i]);
-    for (kal_uintptr i = 0; i < en; ++i) free(ev[i]);
-    free(av); free(ev);
+    release_nulls();
+    release_vectors();
     if (pid < 0) { close(report[0]); return fail(); }
     if (how->job) setpgid(pid, join);                   // both sides, as shells do
     int e = 0;
@@ -925,15 +972,23 @@ void* stop_waker(void*) {
 }
 
 void arm_stop() {
-    if (pipe(g_stop_pipe) != 0) return;
+    if (pipe(g_stop_pipe) != 0) { g_stop_pipe[0] = g_stop_pipe[1] = -1; return; }
     fcntl(g_stop_pipe[0], F_SETFD, FD_CLOEXEC);
     fcntl(g_stop_pipe[1], F_SETFD, FD_CLOEXEC);
     fcntl(g_stop_pipe[1], F_SETFL, O_NONBLOCK);
     pthread_attr_t a; pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     pthread_t t;
-    pthread_create(&t, &a, stop_waker, nullptr);
+    const int made = pthread_create(&t, &a, stop_waker, nullptr);
     pthread_attr_destroy(&a);
+    // WITHOUT THE CONTEXT THAT WAKES THE WORD'S WAITERS THERE IS NO WORD: a
+    // word whose waiters could not be woken is not answered, and no handler
+    // is installed.
+    if (made != 0) {
+        close(g_stop_pipe[0]); close(g_stop_pipe[1]);
+        g_stop_pipe[0] = g_stop_pipe[1] = -1;
+        return;
+    }
     for (const int sig : g_stop_signals) {
         struct sigaction old{};
         if (sigaction(sig, nullptr, &old) == 0 && old.sa_handler == SIG_IGN) continue;
