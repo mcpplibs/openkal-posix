@@ -739,8 +739,16 @@ int kal_process_spawn(const kal_spawn* how, const char* path, kal_uintptr path_l
         for (int s = 1; s < NSIG; ++s) signal(s, SIG_DFL);
         sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, nullptr);
         if (fchdir(work) != 0) { int e = errno; ssize_t w = write(report[1], &e, sizeof e); (void)w; _exit(127); }
-#if defined(__linux__) || defined(__FreeBSD__)
+        // THE PROGRAM BY ITS DESCRIPTOR, which names what was resolved relative
+        // to `base' before the start: fexecve where the system has it, the
+        // name the system keeps for the descriptor where it states one
+        // (F_GETPATH), and the descriptor's own name in /dev/fd otherwise.
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
         fexecve(exe, av, ev);
+#endif
+#if defined(F_GETPATH)
+        char named[PATH_MAX];
+        if (fcntl(exe, F_GETPATH, named) != -1) execve(named, av, ev);
 #endif
         char self[64]; snprintf(self, sizeof self, "/dev/fd/%d", exe);
         execve(self, av, ev);
@@ -1035,10 +1043,17 @@ int kal_task_wait(const kal_u32* word, kal_u32 expected, kal_u64 timeout_ns) {
     int r = 0;
     if (timeout_ns == 0) r = pthread_cond_wait(&b.c, &b.m);
     else {
+#if defined(__APPLE__)
+        // This system's condition variables measure a bound relative to now.
+        timespec t{ time_t(timeout_ns / 1000000000ull), long(timeout_ns % 1000000000ull) };
+        r = pthread_cond_timedwait_relative_np(&b.c, &b.m, &t);
+#else
+        // The bound on the monotonic clock the condition variable was made with.
         timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
         const kal_u64 end = kal_u64(t.tv_sec) * 1000000000ull + kal_u64(t.tv_nsec) + timeout_ns;
         t.tv_sec = time_t(end / 1000000000ull); t.tv_nsec = long(end % 1000000000ull);
         r = pthread_cond_timedwait(&b.c, &b.m, &t);
+#endif
     }
     --b.waiters;
     pthread_mutex_unlock(&b.m);
@@ -1077,6 +1092,11 @@ void* kal_exec_alloc(kal_uintptr size) {
 }
 void* kal_exec_alloc_at(void* at, kal_uintptr size) {
     if (!at || !size || reinterpret_cast<kal_uintptr>(at) % kal_memory_granularity()) return nullptr;
+#if !defined(MAP_FIXED_NOREPLACE) && !defined(MAP_EXCL)
+    // No mapping at an address that refuses what is already there, so
+    // KAL_EXEC_PROP_PLACE is not claimed and a region at an address is refused.
+    return nullptr;
+#endif
     int fl = MAP_PRIVATE | MAP_ANON;
 #if defined(MAP_FIXED_NOREPLACE)
     fl |= MAP_FIXED_NOREPLACE;
