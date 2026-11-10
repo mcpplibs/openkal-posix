@@ -43,6 +43,9 @@
 #if defined(__FreeBSD__) || defined(__DragonFly__)
 #include <pthread_np.h>
 #endif
+#if defined(__APPLE__)
+#include <sys/random.h>   // getentropy
+#endif
 
 extern char** environ;
 
