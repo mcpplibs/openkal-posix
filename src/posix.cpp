@@ -743,12 +743,22 @@ int kal_process_spawn(const kal_spawn* how, const char* path, kal_uintptr path_l
         // to `base' before the start: fexecve where the system has it, the
         // name the system keeps for the descriptor where it states one
         // (F_GETPATH), and the descriptor's own name in /dev/fd otherwise.
+        // An answer about the program itself ends the attempts: the next way
+        // of naming it would only answer about the name.
+        auto refused = [&](int why) {
+            ssize_t w = write(report[1], &why, sizeof why); (void)w;
+            _exit(127);
+        };
 #if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
         fexecve(exe, av, ev);
+        if (errno == ENOEXEC || errno == E2BIG || errno == ENOMEM) refused(errno);
 #endif
 #if defined(F_GETPATH)
         char named[PATH_MAX];
-        if (fcntl(exe, F_GETPATH, named) != -1) execve(named, av, ev);
+        if (fcntl(exe, F_GETPATH, named) != -1) {
+            execve(named, av, ev);
+            refused(errno);
+        }
 #endif
         char self[64]; snprintf(self, sizeof self, "/dev/fd/%d", exe);
         execve(self, av, ev);
