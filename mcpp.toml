@@ -1,0 +1,62 @@
+[package]
+namespace   = "mcpplibs"
+name        = "openkal-posix"
+version     = "0.1.0"
+description = "An implementation of openkal written above a POSIX C library: the system's own C library beneath, openkal's interfaces above, for the systems that have no implementation of their own."
+license     = "Apache-2.0"
+authors     = ["mcpplibs"]
+repo        = "https://github.com/mcpplibs/openkal-posix"
+
+# The layer this package supplies.
+provides    = ["mcpp:kernel-abi=openkal"]
+
+# AND THE LAYER IT IS WRITTEN ABOVE. This implementation calls the C library
+# --- open, fork, pthread_create --- so it can only be placed above one, and
+# never beneath a C library that is itself written above openkal (openkal-musl):
+# that C library's functions would call this implementation, and this
+# implementation would call them back (`kal_time_wall' → `clock_gettime' →
+# `kal_time_wall'). A build tool that checks that the requirements of the
+# layers form no circle (mcpp 2026.11.10.1, `layer-cycle') refuses that graph
+# before anything is compiled; an older engine reads the requirement and does
+# not check it.
+requires    = ["mcpp:c-abi"]
+
+# WHICH INTERFACES THIS IMPLEMENTATION PROVIDES, AND NO OTHER. An interface it
+# does not provide is absent: it is not in this list, not in kal_interfaces(),
+# and none of its names is defined (SPEC.md clause 6.1). A program that calls
+# one fails at link naming it, and a loader that binds by this list leaves it
+# unbound. The conformance suite's three-way check compares this list with
+# kal_interfaces() and with the names the artefact exports.
+#
+# Absent: openkal.net and openkal.datagram (not yet written over sockets),
+# openkal.prof and openkal.debug (no portable source of samples or symbols).
+[kernel-abi]
+provides-interfaces = [
+    "openkal.abort",
+    "openkal.stream",
+    "openkal.memory",
+    "openkal.env",
+    "openkal.time",
+    "openkal.random",
+    "openkal.fs",
+    "openkal.process",
+    "openkal.task",
+    "openkal.exec",
+    "openkal.terminal",
+    "openkal.timeout",
+    "openkal.map",
+    "openkal.region",
+    "openkal.space",
+]
+
+[dependencies]
+openkal = "0.25.0"
+
+[build]
+sources = ["src/*.cpp"]
+# No exception propagates out of a C entry point, and nothing here is
+# identified at run time. The flags are attached to this package's sources;
+# the conformance tests are consumers.
+flags = [
+  { glob = "src/**", cxxflags = ["-fno-exceptions", "-fno-rtti"] },
+]
