@@ -971,9 +971,9 @@ void init_buckets() {
         b.waiters = 0;
     }
 }
-bucket& bucket_of(const kal_u32* w) {
+bucket* bucket_of(const kal_u32* w) {
     pthread_once(&g_buckets_once, init_buckets);
-    return g_buckets[(reinterpret_cast<kal_uintptr>(w) >> 2) % 64];
+    return &g_buckets[(reinterpret_cast<kal_uintptr>(w) >> 2) % 64];
 }
 }  // namespace
 
@@ -1028,7 +1028,7 @@ int kal_task_set_priority(kal_uintptr pr) {
 }
 int kal_task_wait(const kal_u32* word, kal_u32 expected, kal_u64 timeout_ns) {
     if (!word) return kal_err_invalid;
-    bucket& b = bucket_of(word);
+    bucket& b = *bucket_of(word);
     pthread_mutex_lock(&b.m);
     if (__atomic_load_n(word, __ATOMIC_SEQ_CST) != expected) { pthread_mutex_unlock(&b.m); return kal_ok; }  // changed already: re-examine
     ++b.waiters;
@@ -1046,7 +1046,7 @@ int kal_task_wait(const kal_u32* word, kal_u32 expected, kal_u64 timeout_ns) {
 }
 int kal_task_wake(const kal_u32* word, kal_uintptr count, kal_uintptr* woken) {
     if (!word) return kal_err_invalid;
-    bucket& b = bucket_of(word);
+    bucket& b = *bucket_of(word);
     pthread_mutex_lock(&b.m);
     const unsigned n = b.waiters;
     if (count && n) pthread_cond_broadcast(&b.c);
