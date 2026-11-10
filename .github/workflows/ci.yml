@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  MCPP_VERSION: 2026.11.9.1
+  XLINGS_VERSION: v2026.10.26.1
+  XLINGS_NON_INTERACTIVE: '1'
+
+jobs:
+  # THE CONFORMANCE SUITE, ABOVE THE SYSTEM'S OWN C LIBRARY, on each system this
+  # implementation is examined on: Linux with glibc and macOS with libSystem,
+  # natively. The suite runs through the mtest engine (tools/run-conformance.sh
+  # with MTEST set): one case per interface, its observations within it. Its
+  # three-way check compares the manifest's provides-interfaces, kal_interfaces()
+  # and the names the artefact exports, so an interface stated and not provided,
+  # or provided and not stated, fails the job.
+  conformance:
+    name: conformance (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: 'linux-x86_64, gcc',  os: ubuntu-24.04, toolchain: 'gcc@16.1.0'  }
+          - { name: 'linux-x86_64, llvm', os: ubuntu-24.04, toolchain: 'llvm@22.1.8' }
+          - { name: 'macos-arm64, llvm',  os: macos-15,     toolchain: 'llvm@20.1.7' }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The committed manifest names no local directory
+        run: |
+          set -euo pipefail
+          bad=$(grep -nE '^[a-z-]+ = \{[^}]*path = "(/|[A-Za-z]:)' mcpp.toml || true)
+          if [ -n "$bad" ]; then
+            echo "::error::the committed manifest names an absolute path"; printf '%s\n' "$bad"; exit 1
+          fi
+
+      # The specification of the same-named branch where one exists, else its
+      # default branch: a change spanning both is examined as written.
+      - name: The specification
+        run: |
+          git clone --quiet https://github.com/mcpplibs/openkal.git .spec
+          branch='${{ github.head_ref || github.ref_name }}'
+          if git -C .spec rev-parse --verify --quiet "origin/$branch" > /dev/null; then
+            git -C .spec checkout --quiet "origin/$branch"
+            echo "the specification is at $branch"
+          else
+            echo "the specification has no $branch; its default branch is used"
+          fi
+
+      - name: Install xlings
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.sh \
+            | bash -s "$XLINGS_VERSION"
+          echo "$HOME/.xlings/subos/current/bin" >> "$GITHUB_PATH"
+
+      - name: Install mcpp
+        run: |
+          xlings update
+          xlings install "mcpp@$MCPP_VERSION" -y -g
+          mcpp --version
+          mcpp self config --mirror GLOBAL
+
+      - name: Select the toolchain
+        run: |
+          spec='${{ matrix.toolchain }}'
+          mcpp toolchain install "${spec%@*}" "${spec#*@}"
+          mcpp toolchain default "$spec"
+          mcpp toolchain list
+
+      - uses: ./.github/actions/mtest
+
+      # Every interface the manifest states, and no other: the sets named are
+      # the conformance suite's features for exactly those interfaces.
+      - name: Every interface this implementation states
+        run: |
+          set -euo pipefail
+          bash .spec/tools/run-conformance.sh openkal-posix . \
+            full,exec,random,terminal,space,timeout,map,region
+
+      - name: The failing cases, explained
+        if: failure()
+        run: |
+          [ -n "${MTEST:-}" ] && [ -d .spec/conformance/.mtest ] || exit 0
+          ( cd .spec/conformance && "$MTEST" explain ) || true
+
+      # The runs, reported and kept for the report job.
+      - uses: ./.github/actions/test-report
+        if: always()
+        with:
+          name: mtest-${{ github.job }}-${{ strategy.job-index }}
+
+  # EVERY JOB'S RUNS AS ONE REPORT (`mtest ci report`, the workflow run's group).
+  report:
+    name: tests (report)
+    needs: conformance
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/mtest
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mtest-*
+          path: ${{ runner.temp }}/stores
+      - name: Every job's runs, reported together
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          for store in "$RUNNER_TEMP"/stores/*/; do
+            [ -f "$store/index.ndjson" ] || continue
+            "$MTEST" store import --from "$store"
+            found=1
+          done
+          if [ "$found" = 0 ]; then echo "no job kept a run" >> "$GITHUB_STEP_SUMMARY"; exit 0; fi
+          "$MTEST" ci report --group "$GITHUB_RUN_ID" --out "$RUNNER_TEMP/tests.md"
+          cat "$RUNNER_TEMP/tests.md" >> "$GITHUB_STEP_SUMMARY"
