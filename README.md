@@ -5,8 +5,15 @@ a POSIX C library.
 
 ```toml
 [dependencies]
-openkal-posix = "0.1.0"
+openkal-posix = "0.1.1"
 ```
+
+## What 0.1.1 corrects
+
+The manifest declares `openkal = "^0.25.0"`. An implementation written against a
+patch release of the specification conforms to every later patch of that minor
+version (openkal clause 8); with an exact version, a consumer that names openkal
+0.25.1 could not resolve with this implementation.
 
 ## What it is for
 
