@@ -90,8 +90,8 @@ jobs:
       - name: The failing cases, explained
         if: failure()
         run: |
-          [ -n "${MTEST:-}" ] && [ -d .spec/conformance/.mtest ] || exit 0
-          ( cd .spec/conformance && "$MTEST" explain ) || true
+          [ -n "${MTEST:-}" ] && [ -d .spec/tests/cts/.mtest ] || exit 0
+          ( cd .spec/tests/cts && "$MTEST" explain ) || true
 
       # The runs, reported and kept for the report job.
       - uses: ./.github/actions/test-report

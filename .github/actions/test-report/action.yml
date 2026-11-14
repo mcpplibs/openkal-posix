@@ -11,7 +11,7 @@ inputs:
   stores:
     description: the stores `mcpp test` kept in this job, relative to the workspace, separated by spaces
     required: false
-    default: .spec/conformance/.mtest
+    default: .spec/tests/cts/.mtest
 runs:
   using: composite
   steps:
