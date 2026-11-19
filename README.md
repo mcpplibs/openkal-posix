@@ -5,8 +5,27 @@ a POSIX C library.
 
 ```toml
 [dependencies]
-openkal-posix = "0.1.1"
+openkal-posix = "0.2.0"
 ```
+
+## What 0.2 changes (openkal 0.26)
+
+**A start is bounded by the system alone** (clause 7.6). This implementation kept
+no bound of its own: both vectors of a start are allocated at their measured
+size, and a started program reads the vectors the C library gave it. What
+changes is the report of the system's refusal. A start whose arguments and
+environment exceed what the system admits is answered `E2BIG` by the `exec`
+family, and that is now `kal_err_no_space`, where it was `kal_err_io`. Measured
+on Linux x86_64 (glibc) with the specification's suite: 2,000 arguments and
+2,000 variables reach the started copy, and an argument of 1 MiB is refused
+with `kal_err_no_space`; before the change that observation did not hold.
+
+**Observable units are not claimed, as before** (clause 7.18).
+`kal_process_props` does not state `KAL_PROCESS_PROP_JOB_OBSERVE`, and
+`kal_process_job_create` answers `kal_err_not_supported`; openkal 0.26 requires
+the two to agree, and they did.
+
+The manifest declares `openkal = "^0.26.0"`.
 
 ## What 0.1.1 corrects
 
