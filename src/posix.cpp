@@ -66,6 +66,9 @@ int translate(int e) {
         case ENOMEM:       return kal_err_no_memory;
         case ENOSPC:       return kal_err_no_space;
         case EDQUOT:       return kal_err_no_space;
+        // A start whose arguments and environment exceed what the system admits
+        // (ARG_MAX, and on Linux 128 KiB for one string): openkal 0.26, clause 7.6.
+        case E2BIG:        return kal_err_no_space;
         case EACCES:
         case EPERM:
         case EROFS:        return kal_err_permission;
